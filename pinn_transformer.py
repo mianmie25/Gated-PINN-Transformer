@@ -41,7 +41,7 @@ config = {
     'cross_section_area': 256,        # 试件横截面积 (mm²)
     'elastic_modulus': 210e3,         # 弹性模量 (MPa，210GPa = 210×10³ MPa)
     'poisson_ratio': 0.3,             # 泊松比
-    'yield_strength': 980,            # 屈服强度 (MPa)
+    'yield_strength': 725,            # 屈服强度 (MPa)
     'pinn_loss_weight': 0.01,          # 物理损失权重（可调整，平衡MSE损失和物理损失）
 }
 
