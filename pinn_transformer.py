@@ -66,12 +66,11 @@ class FatigueDataset(Dataset):
         self.labels = []
         for _, row in self.metadata.iterrows():
             feat_path = os.path.join(self.features_dir, row['feature_file'])
-            # ========== 修改：读取两列（归一化轴向力 + 归一化塑性应变） ==========
+            # ========== 读取两列（归一化轴向力 + 归一化塑性应变） ==========
             feat = pd.read_csv(feat_path, usecols=['normalized_force', 'normalized_plastic_strain']).values
             self.features.append(feat)
             self.labels.append(row['log_remaining_life'])
-
-        # 现在features形状为 (n_samples, 1000, 2)，兼容原有维度逻辑
+            
         self.features = np.array(self.features, dtype=np.float32)  # (n_samples, 1000, 2)
         self.labels = np.array(self.labels, dtype=np.float32)  # (n_samples,)
 
@@ -138,7 +137,6 @@ class TransformerRegressor(nn.Module):
             nn.ReLU(),
             nn.Linear(32, 1)
         )
-        # ========== 核心修复：补充 _init_weights 方法 ==========
         self._init_weights()
 
     # ========== 定义权重初始化函数 ==========
@@ -154,7 +152,7 @@ class TransformerRegressor(nn.Module):
                 nn.init.constant_(m.weight, 1.0)
                 nn.init.constant_(m.bias, 0.0)
 
-    # 前向传播（移除所有门控注意力逻辑）
+    # 前向传播
     def forward(self, x, return_attention=False):
         x = self.embedding(x)
         x = self.embedding_dropout(x)  # 嵌入层Dropout
@@ -164,7 +162,7 @@ class TransformerRegressor(nn.Module):
         attn_weights = None
         gate_values = None  # 保留变量避免调用处报错，始终为None
 
-        # 【完全删除】门控注意力调用逻辑
+        # 门控注意力调用逻辑
         # 直接执行Transformer Encoder
         x = self.transformer_encoder(x)
         x = x.permute(1, 2, 0)
@@ -319,7 +317,7 @@ def train_model(model, train_loader, test_loader, config):
             model.load_state_dict(early_stopping.best_model_state)
             break
 
-    # 加载最优模型（不变）
+    # 加载最优模型
     if early_stopping.best_model_state is not None:
         model.load_state_dict(early_stopping.best_model_state)
 
@@ -333,7 +331,7 @@ def bayesian_predict(model, test_loader, config):
     y_true = []
     y_pred_samples = []
 
-    # 强制开启所有Dropout层（MCD核心，增强随机性）
+    # 强制开启所有Dropout层
     for m in model.modules():
         if isinstance(m, nn.Dropout):
             m.train()
@@ -384,7 +382,7 @@ def calculate_metrics(y_true, y_pred_mean, y_true_actual, y_pred_mean_actual):
     rmse_actual = np.sqrt(mean_squared_error(y_true_actual, y_pred_mean_actual))
     r2_actual = r2_score(y_true_actual, y_pred_mean_actual)
 
-    # 计算相对误差（工程常用）
+    # 计算相对误差
     relative_error = np.mean(np.abs((y_pred_mean_actual - y_true_actual) / (y_true_actual + 1e-8))) * 100  # 百分比
 
     metrics = {
@@ -557,12 +555,12 @@ def analyze_uncertainty(y_true, y_pred_mean, y_pred_std, y_true_actual, y_pred_m
     corr_log, p_value_log = safe_pearsonr(y_pred_std, error_log)
     corr_actual, p_value_actual = safe_pearsonr(y_pred_std_actual, error_actual)
 
-    # 打印结果（兼容nan）
+    # 打印结果
     print(f"Log10尺度：标准差与实际误差的相关系数 = {corr_log:.4f}" if not np.isnan(corr_log) else "Log10尺度：相关系数计算失败（方差为0/样本不足）")
     print(f"实际寿命尺度：标准差与实际误差的相关系数 = {corr_actual:.4f}" if not np.isnan(corr_actual) else "实际寿命尺度：相关系数计算失败（方差为0/样本不足）")
     print("说明：相关系数越接近1，说明模型的不确定性评估越可靠（标准差大→误差大）")
 
-    # 可视化（兼容nan，避免绘图报错）
+    # 可视化
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
 
     # Log10尺度
@@ -595,7 +593,7 @@ def analyze_uncertainty(y_true, y_pred_mean, y_pred_std, y_true_actual, y_pred_m
     plt.savefig(os.path.join(config['save_fig_dir'], 'uncertainty_reliability.png'), dpi=300)
     plt.show()
 
-    # 返回不确定性指标（兼容nan）
+    # 返回不确定性指标
     uncertainty_metrics = {
         'corr_log': corr_log if not np.isnan(corr_log) else -999,  # 用-999标记无效值
         'p_value_log': p_value_log if not np.isnan(p_value_log) else -999,
@@ -623,10 +621,10 @@ def visualize_attention_weights(model, test_loader, config):
             print("提示：原生TransformerEncoder未返回注意力权重，跳过可视化")
             break
 
-        # 压缩注意力权重维度（去掉batch维度）
+        # 压缩注意力权重维度
         attn_weights = attn_weights.squeeze(0).cpu().numpy()  # (1000, 1000)
 
-        # 1. 1000步注意力热力图（仅保留纯注意力权重可视化）
+        # 1. 1000步注意力热力图
         fig = plt.figure(figsize=(30, 28))
         ax_main = fig.add_axes([0.08, 0.08, 0.80, 0.88])
         ax_cbar = fig.add_axes([0.90, 0.08, 0.02, 0.88])
@@ -659,7 +657,6 @@ def visualize_attention_weights(model, test_loader, config):
         )
         plt.show()
 
-        # 【完全删除】所有门控强度相关的代码（曲线绘制、统计信息等）
         break
 
 
@@ -723,9 +720,9 @@ def calculate_feature_contribution(model, test_loader, config):
     model.eval()
     device = config['device']
 
-    # 1. 基于注意力权重的贡献度（平均注意力权重）
+    # 1. 基于注意力权重的贡献度
     attn_contribution = []
-    # 2. 基于梯度的贡献度（输入特征的梯度绝对值）
+    # 2. 基于梯度的贡献度
     grad_contribution = []
 
     for batch_feat, batch_label in test_loader:
@@ -828,7 +825,7 @@ def stage3_analysis(model, test_loader, y_true, y_pred_mean, y_pred_std, y_true_
     if config['visualize_attention'] and config['gate_attention']:
         visualize_attention_weights(model, test_loader, config)
     return metrics
-# ====================== 9. 主流程执行（衔接阶段二与阶段三） ======================
+# ====================== 9. 主流程执行 ======================
 if __name__ == '__main__':
     # 加载数据
     full_dataset = FatigueDataset(config['data_dir'])
@@ -859,16 +856,15 @@ if __name__ == '__main__':
     print(f"\nModel initialized on device: {config['device']}")
     print(f"Using gated attention: {config['gate_attention']}")
 
-    # 训练模型（阶段二）
+    # 训练模型
     print("\n===== 开始训练模型 =====")
     model, train_history = train_model(model, train_loader, test_loader, config)
 
-    # 贝叶斯预测（阶段二）
+    # 贝叶斯预测
     print("\n===== 开始贝叶斯预测 =====")
     results = bayesian_predict(model, test_loader, config)
     y_true, y_pred_mean, y_pred_std, y_pred_samples, y_true_actual, y_pred_mean_actual, y_pred_std_actual = results
 
-    # 阶段三：多维度性能验证与可视化
     print("\n===== 开始阶段三：模型性能多维度验证 =====")
     metrics = stage3_analysis(model, test_loader, y_true, y_pred_mean, y_pred_std, y_true_actual, y_pred_mean_actual,
                               y_pred_std_actual, y_pred_samples, train_history, config)
