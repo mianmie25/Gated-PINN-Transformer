@@ -68,9 +68,6 @@ class FatigueDataset(Dataset):
     def __getitem__(self, idx):
         return torch.from_numpy(self.features[idx]), torch.tensor(self.labels[idx]).unsqueeze(0)
 
-
-# ====================== 3. Transformer回归模型 ======================
-# ====================== 3. Transformer回归模型 ======================
 # ====================== 3. Transformer回归模型 ======================
 class TransformerRegressor(nn.Module):
     def __init__(self, input_dim=1, hidden_size=128, num_layers=2, dropout_rate=0.2, nhead=8):
