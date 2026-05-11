@@ -79,7 +79,7 @@ class FatigueDataset(Dataset):
 class GatedAttention(nn.Module):
     def __init__(self, d_model, dropout_rate=config['dropout_rate']):
         super().__init__()
-        self.attention = nn.MultiheadAttention(d_model, num_heads=num_heads, batch_first=False)
+        self.attention = nn.MultiheadAttention(d_model, num_heads=config['nhead'], batch_first=False)
         self.gate = nn.Sequential(
             nn.Linear(d_model * 2, d_model * 2),
             nn.ReLU(),
