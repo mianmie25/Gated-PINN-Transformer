@@ -211,33 +211,33 @@ class TransformerRegressor(nn.Module):
 # ====================== PINN物理约束损失函数 ======================
 def pinn_physical_loss(normalized_force, normalized_plastic_strain, config):
     device = config['device']
-
-    # 固定物理参数
     A = torch.tensor(config['cross_section_area'], device=device, dtype=torch.float32)  # 256 mm²
-    E = torch.tensor(config['elastic_modulus'], device=device, dtype=torch.float32)    # 210e3 MPa
-    sigma_y = torch.tensor(config['yield_strength'], device=device, dtype=torch.float32)# 980 MPa
+    E = torch.tensor(config['elastic_modulus'], device=device, dtype=torch.float32)  # 210e3 MPa
+    sigma_y = torch.tensor(config['yield_strength'], device=device, dtype=torch.float32)  # 980 MPa
+    # 1. 计算实际应力（归一化力 / 截面积）
+    stress = normalized_force / A  # 实际应力 (MPa)
 
-    # ====================== 直接用归一化数据计算 ======================
-    # 归一化应力 = 归一化力 / 截面积
-    stress = normalized_force / A
-
-    # 归一化弹性应变
-    elastic_strain = stress / E
-
-    # 损失1：弹性阶段（应力≤屈服强度）→ 塑性应变应≈0
+    # 2. 弹性阶段损失：应力≤屈服强度时，塑性应变应≈0
     elastic_mask = (stress <= sigma_y).float()
     loss_elastic = torch.mean((normalized_plastic_strain * elastic_mask) ** 2)
 
-    # 损失2：塑性阶段（应力>屈服强度）→ 本构关系约束
+    # 3. 塑性阶段损失：应力>屈服强度时，应力应≥屈服强度（且弹性应变=屈服强度/E）
     plastic_mask = (stress > sigma_y).float()
-    stress_pred = E * (elastic_strain + normalized_plastic_strain)
-    loss_plastic = torch.mean(((stress - stress_pred) * plastic_mask) ** 2)
 
-    # 损失3：塑性应变非负（物理约束）
+    # 约束1：塑性阶段应力不能低于屈服强度
+    loss_plastic_stress = torch.mean(torch.relu(sigma_y - stress) * plastic_mask ** 2)
+    yield_strain = sigma_y / E  # 屈服应变（弹性阶段最大应变）
+    loss_plastic_strain_bounds = torch.mean(
+        torch.relu(yield_strain - (stress / E + normalized_plastic_strain)) * plastic_mask ** 2)
     loss_strain_non_neg = torch.mean(torch.relu(-normalized_plastic_strain) ** 2)
 
-    # 总物理损失
-    total_physical_loss = loss_elastic + loss_plastic + loss_strain_non_neg
+    # 5. 总物理损失（平衡各约束项权重）
+    total_physical_loss = (
+            loss_elastic * 1.0 +  # 弹性阶段塑性应变为0
+            loss_plastic_stress * 1.0 +  # 塑性阶段应力≥屈服强度
+            loss_plastic_strain_bounds * 0.5 +  # 塑性阶段总应变≥屈服应变（可选，权重可调）
+            loss_strain_non_neg * 1.0  # 塑性应变非负
+    )
     return total_physical_loss
 
 
