@@ -209,37 +209,32 @@ class TransformerRegressor(nn.Module):
 
 
 # ====================== PINN物理约束损失函数 ======================
-def pinn_physical_loss(normalized_force, normalized_plastic_strain, config):
+def pinn_physical_loss(normalized_force, total_strain, normalized_plastic_strain, config):
     device = config['device']
-    A = torch.tensor(config['cross_section_area'], device=device, dtype=torch.float32)  # 256 mm²
-    E = torch.tensor(config['elastic_modulus'], device=device, dtype=torch.float32)  # 210e3 MPa
-    sigma_y = torch.tensor(config['yield_strength'], device=device, dtype=torch.float32)  # 980 MPa
-    # 1. 计算实际应力（归一化力 / 截面积）
-    stress = normalized_force / A  # 实际应力 (MPa)
+    # 1. 物理参数
+    A = torch.tensor(config['cross_section_area'], device=device, dtype=torch.float32)  # 横截面积
+    E = torch.tensor(config['elastic_modulus'], device=device, dtype=torch.float32)    # 弹性模量
+    sigma_y = torch.tensor(config['yield_strength'], device=device, dtype=torch.float32)# 屈服强度
 
-    # 2. 弹性阶段损失：应力≤屈服强度时，塑性应变应≈0
-    elastic_mask = (stress <= sigma_y).float()
+    # 2. 计算应力 σ = 力 / 横截面积
+    sigma = normalized_force / A
+    # 3. 按公式计算三个损失项
+    # -------------------------- 损失1：弹性阶段约束 L_elastic --------------------------
+    # 弹性阶段（σ ≤ σ_y）时，塑性应变 ε_p 应接近0
+    elastic_mask = (sigma <= sigma_y).float()  # 指示函数 I(σ ≤ σ_y)
     loss_elastic = torch.mean((normalized_plastic_strain * elastic_mask) ** 2)
-
-    # 3. 塑性阶段损失：应力>屈服强度时，应力应≥屈服强度（且弹性应变=屈服强度/E）
-    plastic_mask = (stress > sigma_y).float()
-
-    # 约束1：塑性阶段应力不能低于屈服强度
-    loss_plastic_stress = torch.mean(torch.relu(sigma_y - stress) * plastic_mask ** 2)
-    yield_strain = sigma_y / E  # 屈服应变（弹性阶段最大应变）
-    loss_plastic_strain_bounds = torch.mean(
-        torch.relu(yield_strain - (stress / E + normalized_plastic_strain)) * plastic_mask ** 2)
-    loss_strain_non_neg = torch.mean(torch.relu(-normalized_plastic_strain) ** 2)
-
-    # 5. 总物理损失（平衡各约束项权重）
-    total_physical_loss = (
-            loss_elastic * 1.0 +  # 弹性阶段塑性应变为0
-            loss_plastic_stress * 1.0 +  # 塑性阶段应力≥屈服强度
-            loss_plastic_strain_bounds * 0.5 +  # 塑性阶段总应变≥屈服应变（可选，权重可调）
-            loss_strain_non_neg * 1.0  # 塑性应变非负
-    )
+    # -------------------------- 损失2：塑性阶段本构约束 L_plastic --------------------------
+    # 塑性阶段（σ > σ_y）时，总应变 ε = 弹性应变(σ/E) + 塑性应变 ε_p
+    plastic_mask = (sigma > sigma_y).float()  # 指示函数 I(σ > σ_y)
+    elastic_strain = sigma / E  # 弹性应变 σ/E
+    constitutive_error = total_strain - (elastic_strain + normalized_plastic_strain)
+    loss_plastic = torch.mean(constitutive_error ** 2 * plastic_mask)
+    # -------------------------- 损失3：塑性应变非负约束 L_non-neg --------------------------
+    # 塑性应变 ε_p 不能为负，负的部分会产生损失
+    loss_non_neg = torch.mean(torch.relu(-normalized_plastic_strain) ** 2)
+    # 4. 总物理损失
+    total_physical_loss = loss_elastic + loss_plastic + loss_non_neg
     return total_physical_loss
-
 
 # ====================== 6. 训练函数 ======================
 def train_model(model, train_loader, test_loader, config):
