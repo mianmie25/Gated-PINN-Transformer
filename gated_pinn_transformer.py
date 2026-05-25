@@ -209,30 +209,41 @@ class TransformerRegressor(nn.Module):
 
 
 # ====================== PINN物理约束损失函数 ======================
-def pinn_physical_loss(normalized_force, total_strain, normalized_plastic_strain, config):
+def pinn_physical_loss(normalized_force, normalized_plastic_strain, config):
     device = config['device']
     # 1. 物理参数
-    A = torch.tensor(config['cross_section_area'], device=device, dtype=torch.float32)  # 横截面积
-    E = torch.tensor(config['elastic_modulus'], device=device, dtype=torch.float32)    # 弹性模量
-    sigma_y = torch.tensor(config['yield_strength'], device=device, dtype=torch.float32)# 屈服强度
+    A = torch.tensor(config['cross_section_area'], device=device, dtype=torch.float32)  # 横截面积 (mm²)
+    E = torch.tensor(config['elastic_modulus'], device=device, dtype=torch.float32)  # 弹性模量 (MPa)
+    sigma_y = torch.tensor(config['yield_strength'], device=device, dtype=torch.float32)  # 屈服强度 (MPa)
 
-    # 2. 计算应力 σ = 力 / 横截面积
-    sigma = normalized_force / A
-    # 3. 按公式计算三个损失项
+    # 2. 核心推导：从归一化力计算应力和弹性应变，再推导总应变
+    # 2.1 计算应力 σ = 力 / 横截面积（保持归一化尺度的一致性）
+    sigma = normalized_force / A  # (batch, seq_len, 1)
+
+    # 2.2 计算弹性应变 ε_e = σ / E（弹性阶段应变本构）
+    elastic_strain = sigma / E  # (batch, seq_len, 1)
+
+    # 2.3 推导总应变 ε = 弹性应变 + 塑性应变（本构关系恒成立）
+    total_strain = elastic_strain + normalized_plastic_strain  # (batch, seq_len, 1)
+
+    # 3. 计算三个物理约束损失项
     # -------------------------- 损失1：弹性阶段约束 L_elastic --------------------------
     # 弹性阶段（σ ≤ σ_y）时，塑性应变 ε_p 应接近0
-    elastic_mask = (sigma <= sigma_y).float()  # 指示函数 I(σ ≤ σ_y)
+    elastic_mask = (sigma <= sigma_y).float()  # 弹性阶段指示函数 (batch, seq_len, 1)
     loss_elastic = torch.mean((normalized_plastic_strain * elastic_mask) ** 2)
-    # -------------------------- 损失2：塑性阶段本构约束 L_plastic --------------------------
-    # 塑性阶段（σ > σ_y）时，总应变 ε = 弹性应变(σ/E) + 塑性应变 ε_p
-    plastic_mask = (sigma > sigma_y).float()  # 指示函数 I(σ > σ_y)
-    elastic_strain = sigma / E  # 弹性应变 σ/E
+
+    # -------------------------- 损失2：塑性阶段本构自洽约束 L_plastic --------------------------
+    # 塑性阶段（σ > σ_y）时，总应变需满足 ε = ε_e + ε_p（自洽性校验）
+    # 误差 = 推导的总应变 - (弹性应变 + 塑性应变)（理论上应为0，约束数值计算的一致性）
+    plastic_mask = (sigma > sigma_y).float()  # 塑性阶段指示函数 (batch, seq_len, 1)
     constitutive_error = total_strain - (elastic_strain + normalized_plastic_strain)
     loss_plastic = torch.mean(constitutive_error ** 2 * plastic_mask)
+
     # -------------------------- 损失3：塑性应变非负约束 L_non-neg --------------------------
-    # 塑性应变 ε_p 不能为负，负的部分会产生损失
+    # 塑性应变 ε_p 不能为负，负的部分产生损失（工程物理约束）
     loss_non_neg = torch.mean(torch.relu(-normalized_plastic_strain) ** 2)
-    # 4. 总物理损失
+
+    # 4. 总物理损失（三项加权求和，保持原逻辑）
     total_physical_loss = loss_elastic + loss_plastic + loss_non_neg
     return total_physical_loss
 
