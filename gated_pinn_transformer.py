@@ -413,20 +413,6 @@ class TransformerRegressor(nn.Module):
         return out
 
 def cdm_physical_loss(pred_log_life, raw_force_kN, raw_plastic_strain, cfg):
-    """
-    CDM-inspired residual:
-
-        dD/dN = alpha * (Wp_norm)^beta
-
-        failure: D = 1
-
-        => N_pred * dD/dN ≈ 1
-
-    raw_force_kN: (batch, seq, 1), original scale
-    raw_plastic_strain: (batch, seq, 1), original scale
-    pred_log_life: (batch, 1)
-    """
-
     area = cfg["cross_section_area"]
     sigma_y = cfg["yield_strength"]
     alpha = cfg["cdm_alpha"]
@@ -863,11 +849,6 @@ def analyze_uncertainty(
     else:
         print("实际寿命尺度：Pearson r 计算失败")
 
-    print(
-        "说明：r 越接近 1，说明模型的不确定性估计越可靠，"
-        "即预测标准差越大，实际预测误差也越大。"
-    )
-
     # 6. 可视化：不确定性 vs 误差
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
@@ -1203,9 +1184,6 @@ if __name__ == "__main__":
         results_save_path,
         index=False,
     )
-
-    print(f"\n预测结果已保存至: {results_save_path}")
-
     # 10. 注意力热力图
     if config["visualize_attention"] and config["gate_attention"]:
         visualize_attention_heatmap(
