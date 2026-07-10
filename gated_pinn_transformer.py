@@ -1,106 +1,295 @@
+import os
+import re
+import warnings
+from copy import deepcopy
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, random_split
 import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.model_selection import train_test_split
+from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from scipy.stats import pearsonr
-import os
-import warnings
-
-warnings.filterwarnings('ignore')
-
-# ====================== 1. 配置超参数 ======================
+warnings.filterwarnings("ignore")
 config = {
-    # 数据相关
-    'data_dir': r'preprocessed_data_30%life_fft_downsample',
-    'train_ratio': 0.5,
-    'batch_size': 8,
-    'd_model': 64,
-    'nhead': 4,
-    'num_encoder_layers': 2,
-    'dim_feedforward': 64,
-    'dropout_rate': 0.3,
-    'gate_attention': True,
-    'epochs': 50000,
-    'lr': 3e-4,
-    'weight_decay': 1e-4,
-    'patience': 50000,
-    'factor': 0.7,
-    'mc_samples': 50,
-    'device': torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
-    'save_fig_dir': 'transformer_bayes_gated_stage3_results',
-    'save_metrics_dir': 'stage3_metrics',
-    'visualize_attention': True,
-    'uncertainty_analysis': True,
-    'random_seed': 42,  # 固定随机种子保证可复现
-    'cross_section_area': 256,        # 试件横截面积 (mm²)
-    'elastic_modulus': 210e3,         # 弹性模量 (MPa，210GPa = 210×10³ MPa)
-    'poisson_ratio': 0.3,             # 泊松比
-    'yield_strength': 725,            # 屈服强度 (MPa)
-    'pinn_loss_weight': 0.01,          # 物理损失权重（可调整，平衡MSE损失和物理损失）
+    # -------------------- data --------------------
+    "data_dir": r"preprocessed_data_30%life_fft_downsample",
+    "train_ratio": 0.7,
+    "batch_size": 8,
+    "target_length": 1000,
+    "cycle_ratio": 0.5,
+    "random_seed": 100,
+    # -------------------- model --------------------
+    "d_model": 64,
+    "nhead": 2,
+    "num_encoder_layers": 2,
+    "dim_feedforward": 64,
+    "dropout_rate": 0.3,
+    "gate_attention": True,
+    # -------------------- train --------------------
+    "epochs": 10000,
+    "lr": 3e-4,
+    "weight_decay": 1e-4,
+    "patience": 10000,
+    "factor": 0.7,
+    "mc_samples": 50,
+    # -------------------- device --------------------
+    "device": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+    # -------------------- output --------------------
+    "save_fig_dir": "transformer_bayes_gated_cdm_results",
+    "save_metrics_dir": "cdm_metrics",
+    "visualize_attention": True,
+    "uncertainty_analysis": True,
+    # -------------------- physics --------------------
+    "cross_section_area": ,      # mm^2
+    "elastic_modulus": ,         # MPa
+    "yield_strength": ,          # MPa
+    # CDM parameters
+    "physics_loss_weight": ,
+    "cdm_alpha": ,
+    "cdm_beta": ,
+    "w_ref_mpa": ,
+    "strain_nonneg_weight": ,
+    "yield_penalty_weight": ,
+}
+BUTT_PATHS = {
+  
 }
 
-# 创建结果保存目录
-os.makedirs(config['save_fig_dir'], exist_ok=True)
-os.makedirs(config['save_metrics_dir'], exist_ok=True)
-np.random.seed(config['random_seed'])
-torch.manual_seed(config['random_seed'])
+CROSS_PATHS = {
 
+}
 
-# ====================== 2. 自定义数据集 ======================
+RAW_PATHS = {}
+RAW_PATHS.update(BUTT_PATHS)
+RAW_PATHS.update(CROSS_PATHS)
+os.makedirs(config["save_fig_dir"], exist_ok=True)
+os.makedirs(config["save_metrics_dir"], exist_ok=True)
+np.random.seed(config["random_seed"])
+torch.manual_seed(config["random_seed"])
+
+def base_sample_name(sample_name):
+    return re.sub(r"_(original|aug\d+)$", "", sample_name)
+
+def get_variant_name(sample_name):
+    m = re.search(r"_(original|aug\d+)$", sample_name)
+    return m.group(1) if m else "original"
+
+def get_closest_recorded_cycle(theoretical_cycle, recorded_cycles):
+    unique_cycles = np.unique(recorded_cycles)
+    unique_cycles.sort()
+
+    if theoretical_cycle <= unique_cycles[0]:
+        return unique_cycles[0]
+
+    if theoretical_cycle >= unique_cycles[-1]:
+        return unique_cycles[-1]
+
+    for i in range(len(unique_cycles) - 1):
+        if unique_cycles[i] <= theoretical_cycle <= unique_cycles[i + 1]:
+            diff_left = theoretical_cycle - unique_cycles[i]
+            diff_right = unique_cycles[i + 1] - theoretical_cycle
+
+            right_is_round = (
+                unique_cycles[i + 1] % 1000 == 0
+                or unique_cycles[i + 1] % 100 == 0
+                or unique_cycles[i + 1] % 10 == 0
+            )
+            left_is_round = (
+                unique_cycles[i] % 1000 == 0
+                or unique_cycles[i] % 100 == 0
+                or unique_cycles[i] % 10 == 0
+            )
+
+            if right_is_round and not left_is_round:
+                return unique_cycles[i + 1]
+            if left_is_round and not right_is_round:
+                return unique_cycles[i]
+
+            return unique_cycles[i] if diff_left <= diff_right else unique_cycles[i + 1]
+
+    return unique_cycles[np.argmin(np.abs(unique_cycles - theoretical_cycle))]
+
+def extract_cycles_data(cycles, axial_force, plastic_strain, target_cycles):
+    indices = np.where(cycles <= target_cycles)[0]
+
+    if len(indices) == 0:
+        return axial_force[:1000], plastic_strain[:1000], target_cycles
+
+    axial_extracted = axial_force[indices]
+    strain_extracted = plastic_strain[indices]
+    actual_cycles_used = np.max(cycles[indices])
+
+    return axial_extracted, strain_extracted, actual_cycles_used
+
+def downsample_sequence(sequence, target_length=1000):
+    n_original = len(sequence)
+
+    if n_original <= target_length:
+        return sequence.astype(np.float32)
+
+    window = np.hamming(n_original)
+    sequence_windowed = sequence * window
+    fft_spectrum = np.fft.fft(sequence_windowed)
+
+    n_keep = target_length // 2
+    fft_downsampled = np.zeros(target_length, dtype=complex)
+    fft_downsampled[:n_keep] = fft_spectrum[:n_keep]
+    fft_downsampled[-n_keep:] = fft_spectrum[-n_keep:]
+
+    sequence_downsampled = np.fft.ifft(fft_downsampled).real
+    scale_factor = np.max(np.abs(sequence)) / (np.max(np.abs(sequence_downsampled)) + 1e-8)
+    sequence_downsampled = sequence_downsampled * scale_factor
+
+    return sequence_downsampled.astype(np.float32)
+
+def load_raw_reference_map(raw_paths, cycle_ratio=0.5, target_length=1000):
+    raw_map = {}
+    print("正在加载原始未归一化数据，用于CDM物理约束...")
+
+    for exp_name, path in raw_paths.items():
+        if not os.path.exists(path):
+            print(f"  [警告] 原始文件不存在，跳过: {exp_name} -> {path}")
+            continue
+
+        try:
+            df = pd.read_csv(path, skiprows=1, header=None)
+            cycles = df.iloc[:, 1].values.astype(np.float32)
+            axial_force = df.iloc[:, 3].values.astype(np.float32)
+            plastic_strain = df.iloc[:, 4].values.astype(np.float32)
+
+            total_life = np.max(cycles)
+            theoretical_target = total_life * cycle_ratio
+            actual_target_cycles = get_closest_recorded_cycle(theoretical_target, cycles)
+
+            force_seg, strain_seg, actual_cycles_used = extract_cycles_data(
+                cycles,
+                axial_force,
+                plastic_strain,
+                actual_target_cycles,
+            )
+
+            force_down = downsample_sequence(force_seg, target_length)
+            strain_down = downsample_sequence(strain_seg, target_length)
+
+            force_mean = float(np.mean(force_down))
+            force_std = float(np.std(force_down) + 1e-8)
+            strain_mean = float(np.mean(strain_down))
+            strain_std = float(np.std(strain_down) + 1e-8)
+
+            raw_map[exp_name] = {
+                "force_down": force_down,
+                "strain_down": strain_down,
+                "force_mean": force_mean,
+                "force_std": force_std,
+                "strain_mean": strain_mean,
+                "strain_std": strain_std,
+                "actual_cycles_used": float(actual_cycles_used),
+                "total_life": float(total_life),
+                "remaining_life": float(total_life - actual_cycles_used),
+            }
+
+            print(f"  已加载 {exp_name}")
+
+        except Exception as e:
+            print(f"  [失败] {exp_name}: {e}")
+
+    print(f"原始参考样本数: {len(raw_map)}")
+    return raw_map
+
 class FatigueDataset(Dataset):
-    def __init__(self, data_dir, sample_ids=None):
+    def __init__(self, data_dir, raw_reference_map, sample_ids=None):
         self.data_dir = data_dir
-        self.features_dir = os.path.join(data_dir, 'features')
-        self.metadata = pd.read_csv(os.path.join(data_dir, 'metadata.csv'))
+        self.features_dir = os.path.join(data_dir, "features")
+        self.metadata = pd.read_csv(os.path.join(data_dir, "metadata.csv"))
 
         if sample_ids is not None:
-            self.metadata = self.metadata[self.metadata['sample_id'].isin(sample_ids)].reset_index(drop=True)
+            self.metadata = self.metadata[self.metadata["sample_id"].isin(sample_ids)].reset_index(drop=True)
 
         self.features = []
         self.labels = []
-        for _, row in self.metadata.iterrows():
-            feat_path = os.path.join(self.features_dir, row['feature_file'])
-            # ========== 修改：读取两列（归一化轴向力 + 归一化塑性应变） ==========
-            feat = pd.read_csv(feat_path, usecols=['normalized_force', 'normalized_plastic_strain']).values
-            self.features.append(feat)
-            self.labels.append(row['log_remaining_life'])
+        self.raw_forces = []
+        self.raw_plastic_strains = []
+        self.sample_names = []
 
-        # 现在features形状为 (n_samples, 1000, 2)，兼容原有维度逻辑
-        self.features = np.array(self.features, dtype=np.float32)  # (n_samples, 1000, 2)
-        self.labels = np.array(self.labels, dtype=np.float32)  # (n_samples,)
+        missing_raw = 0
+
+        for _, row in self.metadata.iterrows():
+            sample_name = row["sample_name"]
+            base_name = base_sample_name(sample_name)
+
+            feat_path = os.path.join(self.features_dir, row["feature_file"])
+            feat = pd.read_csv(
+                feat_path,
+                usecols=["normalized_force", "normalized_plastic_strain"],
+            ).values.astype(np.float32)
+
+            if base_name not in raw_reference_map:
+                missing_raw += 1
+                continue
+
+            ref = raw_reference_map[base_name]
+
+            raw_force = feat[:, 0] * ref["force_std"] + ref["force_mean"]
+            raw_plastic = feat[:, 1] * ref["strain_std"] + ref["strain_mean"]
+
+            self.features.append(feat)
+            self.labels.append(np.float32(row["log_remaining_life"]))
+            self.raw_forces.append(raw_force.astype(np.float32))
+            self.raw_plastic_strains.append(raw_plastic.astype(np.float32))
+            self.sample_names.append(sample_name)
+
+        self.features = np.array(self.features, dtype=np.float32)
+        self.labels = np.array(self.labels, dtype=np.float32)
+        self.raw_forces = np.array(self.raw_forces, dtype=np.float32)
+        self.raw_plastic_strains = np.array(self.raw_plastic_strains, dtype=np.float32)
+
+        if missing_raw > 0:
+            print(f"[警告] 有 {missing_raw} 个样本因找不到原始参考数据而被跳过")
 
     def __len__(self):
-        return len(self.metadata)
+        return len(self.labels)
 
     def __getitem__(self, idx):
-        return torch.from_numpy(self.features[idx]), torch.tensor(self.labels[idx]).unsqueeze(0)
+        return (
+            torch.from_numpy(self.features[idx]),
+            torch.tensor(self.labels[idx]).unsqueeze(0),
+            torch.from_numpy(self.raw_forces[idx]).unsqueeze(-1),
+            torch.from_numpy(self.raw_plastic_strains[idx]).unsqueeze(-1),
+            self.sample_names[idx],
+        )
 
-
-# ====================== 3. 门控注意力机制 ======================
 class GatedAttention(nn.Module):
-    def __init__(self, d_model, dropout_rate=config['dropout_rate']):  # 必须包含 dropout_rate 参数
+    def __init__(self, d_model, nhead, dropout_rate):
         super().__init__()
-        self.attention = nn.MultiheadAttention(d_model, num_heads=config['nhead'], batch_first=False)
+
+        self.attention = nn.MultiheadAttention(
+            d_model,
+            num_heads=nhead,
+            batch_first=False,
+        )
+
         self.gate = nn.Sequential(
             nn.Linear(d_model * 2, d_model * 2),
             nn.ReLU(),
-            nn.Dropout(dropout_rate),  # 门控层Dropout
+            nn.Dropout(dropout_rate),
             nn.Linear(d_model * 2, d_model),
             nn.Sigmoid(),
-            nn.LayerNorm(d_model)
         )
+
         self.norm = nn.LayerNorm(d_model)
-        self.dropout = nn.Dropout(dropout_rate)  # 注意力输出Dropout
+        self.dropout = nn.Dropout(dropout_rate)
 
     def forward(self, x):
-        attn_output, attn_weights = self.attention(x, x, x)
-        attn_output = self.dropout(attn_output)  # 注意力输出Dropout
+        attn_output, attn_weights = self.attention(
+            x,
+            x,
+            x,
+            need_weights=True,
+        )
+
+        attn_output = self.dropout(attn_output)
 
         gate_input = torch.cat([x, attn_output], dim=-1)
         gate = self.gate(gate_input)
@@ -108,468 +297,522 @@ class GatedAttention(nn.Module):
 
         output = x * (1 - gate) + attn_output * gate
         output = self.norm(output)
+
         return output, attn_weights, gate
 
-# ====================== 4. 位置编码 ======================
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=1000):
         super().__init__()
+
         position = torch.arange(max_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2) * (-np.log(10000.0) / d_model))
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2) * (-np.log(10000.0) / d_model)
+        )
+
         pe = torch.zeros(max_len, 1, d_model)
         pe[:, 0, 0::2] = torch.sin(position * div_term)
         pe[:, 0, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pe', pe)
+
+        self.register_buffer("pe", pe)
 
     def forward(self, x):
-        x = x + self.pe[:x.size(0)]
-        return x
+        return x + self.pe[:x.size(0)]
 
-
-# ====================== 5. 带门控注意力的Transformer模型 ======================
 class TransformerRegressor(nn.Module):
-    def __init__(self, input_dim=1, d_model=64, nhead=config['nhead'], num_encoder_layers=config['num_encoder_layers'],
-                 dim_feedforward=config['dim_feedforward'], dropout_rate=config['dropout_rate'], gate_attention=True):
+    def __init__(
+        self,
+        input_dim=2,
+        d_model=64,
+        nhead=2,
+        num_encoder_layers=2,
+        dim_feedforward=64,
+        dropout_rate=0.3,
+        gate_attention=True,
+    ):
         super().__init__()
-        self.d_model = d_model
+
         self.gate_attention = gate_attention
-        self.dropout_rate = dropout_rate  # 统一Dropout概率
 
-        # 输入嵌入 + Dropout
         self.embedding = nn.Linear(input_dim, d_model)
-        self.embedding_dropout = nn.Dropout(dropout_rate)  # 嵌入层Dropout
+        self.embedding_dropout = nn.Dropout(dropout_rate)
 
-        # 位置编码
-        self.pos_encoder = PositionalEncoding(d_model, max_len=1000)
+        self.pos_encoder = PositionalEncoding(
+            d_model,
+            max_len=config["target_length"],
+        )
 
-        # 门控注意力层（添加Dropout）
         if gate_attention:
-            self.gated_attn = GatedAttention(d_model, dropout_rate)  # 传入Dropout概率
+            self.gated_attn = GatedAttention(
+                d_model,
+                nhead,
+                dropout_rate,
+            )
 
-        # Transformer Encoder（强化Dropout）
         encoder_layers = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
             dim_feedforward=dim_feedforward,
-            dropout=dropout_rate,  # Encoder层Dropout
+            dropout=dropout_rate,
             batch_first=False,
-            activation='gelu'
+            activation="gelu",
         )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers=num_encoder_layers)
 
-        # 池化后添加Dropout
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layers,
+            num_layers=num_encoder_layers,
+        )
+
         self.pool = nn.AdaptiveAvgPool1d(1)
-        self.pool_dropout = nn.Dropout(dropout_rate)  # 池化层Dropout
+        self.pool_dropout = nn.Dropout(dropout_rate)
 
-        # 输出层
         self.fc = nn.Sequential(
             nn.Linear(d_model, 32),
             nn.Dropout(dropout_rate),
             nn.ReLU(),
-            nn.Linear(32, 1)
+            nn.Linear(32, 1),
         )
-        # ========== 核心修复：补充 _init_weights 方法 ==========
+
         self._init_weights()
 
-    # ========== 定义权重初始化函数 ==========
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                # 线性层用xavier初始化
                 nn.init.xavier_uniform_(m.weight)
+
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0.0)
+
             elif isinstance(m, nn.LayerNorm):
-                # 层归一化初始化
                 nn.init.constant_(m.weight, 1.0)
                 nn.init.constant_(m.bias, 0.0)
 
-    # 前向传播（保持之前的逻辑不变）
     def forward(self, x, return_attention=False):
         x = self.embedding(x)
-        x = self.embedding_dropout(x)  # 嵌入层Dropout
+        x = self.embedding_dropout(x)
+
         x = x.permute(1, 0, 2)
         x = self.pos_encoder(x)
 
         attn_weights = None
         gate_values = None
+
         if self.gate_attention:
             x, attn_weights, gate_values = self.gated_attn(x)
 
         x = self.transformer_encoder(x)
+
         x = x.permute(1, 2, 0)
         x = self.pool(x).squeeze(-1)
-        x = self.pool_dropout(x)  # 池化后Dropout
+        x = self.pool_dropout(x)
 
         out = self.fc(x)
+
         if return_attention:
             return out, attn_weights, gate_values
-        else:
-            return out
 
+        return out
 
-# ====================== PINN物理约束损失函数 ======================
-def pinn_physical_loss(normalized_force, normalized_plastic_strain, config):
-    device = config['device']
-    # 1. 物理参数
-    A = torch.tensor(config['cross_section_area'], device=device, dtype=torch.float32)  # 横截面积 (mm²)
-    E = torch.tensor(config['elastic_modulus'], device=device, dtype=torch.float32)  # 弹性模量 (MPa)
-    sigma_y = torch.tensor(config['yield_strength'], device=device, dtype=torch.float32)  # 屈服强度 (MPa)
+def cdm_physical_loss(pred_log_life, raw_force_kN, raw_plastic_strain, cfg):
+    """
+    CDM-inspired residual:
 
-    # 2. 核心推导：从归一化力计算应力和弹性应变，再推导总应变
-    # 2.1 计算应力 σ = 力 / 横截面积（保持归一化尺度的一致性）
-    sigma = normalized_force / A  # (batch, seq_len, 1)
+        dD/dN = alpha * (Wp_norm)^beta
 
-    # 2.2 计算弹性应变 ε_e = σ / E（弹性阶段应变本构）
-    elastic_strain = sigma / E  # (batch, seq_len, 1)
+        failure: D = 1
 
-    # 2.3 推导总应变 ε = 弹性应变 + 塑性应变（本构关系恒成立）
-    total_strain = elastic_strain + normalized_plastic_strain  # (batch, seq_len, 1)
+        => N_pred * dD/dN ≈ 1
 
-    # 3. 计算三个物理约束损失项
-    # -------------------------- 损失1：弹性阶段约束 L_elastic --------------------------
-    # 弹性阶段（σ ≤ σ_y）时，塑性应变 ε_p 应接近0
-    elastic_mask = (sigma <= sigma_y).float()  # 弹性阶段指示函数 (batch, seq_len, 1)
-    loss_elastic = torch.mean((normalized_plastic_strain * elastic_mask) ** 2)
+    raw_force_kN: (batch, seq, 1), original scale
+    raw_plastic_strain: (batch, seq, 1), original scale
+    pred_log_life: (batch, 1)
+    """
 
-    # -------------------------- 损失2：塑性阶段本构自洽约束 L_plastic --------------------------
-    # 塑性阶段（σ > σ_y）时，总应变需满足 ε = ε_e + ε_p（自洽性校验）
-    # 误差 = 推导的总应变 - (弹性应变 + 塑性应变)（理论上应为0，约束数值计算的一致性）
-    plastic_mask = (sigma > sigma_y).float()  # 塑性阶段指示函数 (batch, seq_len, 1)
-    constitutive_error = total_strain - (elastic_strain + normalized_plastic_strain)
-    loss_plastic = torch.mean(constitutive_error ** 2 * plastic_mask)
+    area = cfg["cross_section_area"]
+    sigma_y = cfg["yield_strength"]
+    alpha = cfg["cdm_alpha"]
+    beta = cfg["cdm_beta"]
+    w_ref = cfg["w_ref_mpa"]
 
-    # -------------------------- 损失3：塑性应变非负约束 L_non-neg --------------------------
-    # 塑性应变 ε_p 不能为负，负的部分产生损失（工程物理约束）
-    loss_non_neg = torch.mean(torch.relu(-normalized_plastic_strain) ** 2)
+    # kN -> N, N/mm^2 = MPa
+    stress = raw_force_kN * 1000.0 / area
+    abs_stress = torch.abs(stress)
 
-    # 4. 总物理损失（三项加权求和，保持原逻辑）
-    total_physical_loss = loss_elastic + loss_plastic + loss_non_neg
-    return total_physical_loss
+    plastic_pos = torch.relu(raw_plastic_strain)
 
-# ====================== 6. 训练函数 ======================
-def train_model(model, train_loader, test_loader, config):
-    criterion = nn.MSELoss()
-    optimizer = optim.AdamW(model.parameters(), lr=config['lr'], weight_decay=config['weight_decay'])
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=config['factor'], patience=config['patience'] // 2
+    wp_density = torch.mean(abs_stress * plastic_pos, dim=1)
+    wp_norm = wp_density / (w_ref + 1e-8)
+
+    damage_rate = alpha * torch.pow(wp_norm + 1e-8, beta)
+    pred_life = torch.pow(10.0, pred_log_life)
+
+    cdm_residual = pred_life * damage_rate - 1.0
+    loss_cdm = torch.mean(cdm_residual ** 2)
+
+    loss_nonneg = torch.mean(torch.relu(-raw_plastic_strain) ** 2)
+
+    elastic_mask = (abs_stress <= sigma_y).float()
+    loss_yield = torch.mean((plastic_pos * elastic_mask) ** 2)
+
+    total_loss = (
+        loss_cdm
+        + cfg["strain_nonneg_weight"] * loss_nonneg
+        + cfg["yield_penalty_weight"] * loss_yield
     )
 
-    # 早停机制（原有逻辑完全保留）
-    class EarlyStopping:
-        def __init__(self, patience=5, min_delta=0.0001):
-            self.patience = patience
-            self.min_delta = min_delta
-            self.counter = 0
-            self.best_loss = float('inf')
-            self.best_model_state = None
+    return total_loss
 
-        def __call__(self, val_loss, model):
-            if val_loss < self.best_loss - self.min_delta:
-                self.best_loss = val_loss
-                self.best_model_state = model.state_dict()
-                self.counter = 0
+def create_grouped_train_test_split(metadata, train_ratio=0.7, random_seed=100):
+    meta = metadata.copy()
+    meta["base_name"] = meta["sample_name"].apply(base_sample_name)
+
+    group_df = (
+        meta.groupby("base_name", as_index=False)
+        .agg(
+            log_remaining_life=("log_remaining_life", "mean"),
+            joint_type=("joint_type", "first"),
+        )
+    )
+
+    n_groups = len(group_df)
+    q = min(3, n_groups) if n_groups > 1 else 1
+
+    if q > 1:
+        group_df["life_bin"] = pd.qcut(
+            group_df["log_remaining_life"],
+            q=q,
+            duplicates="drop",
+        ).astype(str)
+    else:
+        group_df["life_bin"] = "all"
+
+    group_df["strata"] = (
+        group_df["joint_type"].astype(str)
+        + "_"
+        + group_df["life_bin"].astype(str)
+    )
+
+    rng = np.random.RandomState(random_seed)
+
+    train_base_names = []
+    test_base_names = []
+
+    for _, sub_df in group_df.groupby("strata"):
+        names = sub_df["base_name"].tolist()
+        rng.shuffle(names)
+
+        n_train = max(1, int(round(len(names) * train_ratio))) if len(names) > 1 else 1
+        n_train = min(n_train, len(names) - 1) if len(names) > 1 else 1
+
+        if len(names) == 1:
+            if len(train_base_names) <= len(test_base_names):
+                train_base_names.extend(names)
             else:
-                self.counter += 1
-                if self.counter >= self.patience:
-                    return True
+                test_base_names.extend(names)
+        else:
+            train_base_names.extend(names[:n_train])
+            test_base_names.extend(names[n_train:])
+
+    if len(test_base_names) == 0 and len(train_base_names) > 1:
+        test_base_names.append(train_base_names.pop())
+
+    if len(train_base_names) == 0 and len(test_base_names) > 1:
+        train_base_names.append(test_base_names.pop())
+
+    train_ids = meta[meta["base_name"].isin(train_base_names)]["sample_id"].tolist()
+    test_ids = meta[meta["base_name"].isin(test_base_names)]["sample_id"].tolist()
+
+    return train_ids, test_ids, train_base_names, test_base_names
+
+class EarlyStopping:
+    def __init__(self, patience=50, min_delta=1e-4):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.best_loss = float("inf")
+        self.best_model_state = None
+
+    def __call__(self, val_loss, model):
+        if val_loss < self.best_loss - self.min_delta:
+            self.best_loss = val_loss
+            self.best_model_state = deepcopy(model.state_dict())
+            self.counter = 0
             return False
 
-    early_stopping = EarlyStopping(patience=config['patience'], min_delta=1e-4)
-    train_history = {'train_loss': [], 'test_loss': []}
-    device = config['device']
+        self.counter += 1
+        return self.counter >= self.patience
 
-    for epoch in range(config['epochs']):
-        # 训练阶段（原有逻辑，已包含PINN损失，无需修改）
+def train_model(model, train_loader, test_loader, cfg):
+    criterion = nn.MSELoss()
+
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=cfg["lr"],
+        weight_decay=cfg["weight_decay"],
+    )
+
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=cfg["factor"],
+        patience=max(10, cfg["patience"] // 4),
+    )
+
+    early_stopping = EarlyStopping(
+        patience=cfg["patience"],
+        min_delta=1e-4,
+    )
+
+    train_history = {
+        "train_loss": [],
+        "test_loss": [],
+        "train_mse": [],
+        "test_mse": [],
+        "train_phy": [],
+        "test_phy": [],
+    }
+
+    device = cfg["device"]
+
+    for epoch in range(cfg["epochs"]):
         model.train()
+
         train_loss = 0.0
-        for batch_feat, batch_label in train_loader:
+        train_mse_sum = 0.0
+        train_phy_sum = 0.0
+
+        for batch_feat, batch_label, raw_force, raw_plastic, _ in train_loader:
             batch_feat = batch_feat.to(device)
             batch_label = batch_label.to(device)
+            raw_force = raw_force.to(device)
+            raw_plastic = raw_plastic.to(device)
 
             optimizer.zero_grad()
+
             outputs = model(batch_feat)
 
-            # 原有MSE预测损失
             mse_loss = criterion(outputs, batch_label)
+            phy_loss = cdm_physical_loss(outputs, raw_force, raw_plastic, cfg)
 
-            # 提取归一化轴向力、塑性应变
-            normalized_force = batch_feat[..., 0:1]
-            normalized_plastic_strain = batch_feat[..., 1:2]
-
-            # 计算PINN物理约束损失
-            physical_loss = pinn_physical_loss(normalized_force, normalized_plastic_strain, config)
-
-            # 训练总损失 = MSE + 权重×PINN损失
-            loss = mse_loss + config['pinn_loss_weight'] * physical_loss
+            loss = mse_loss + cfg["physics_loss_weight"] * phy_loss
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
-            train_loss += loss.item() * batch_feat.size(0)
+            bs = batch_feat.size(0)
+            train_loss += loss.item() * bs
+            train_mse_sum += mse_loss.item() * bs
+            train_phy_sum += phy_loss.item() * bs
 
-        # 训练损失归一化
         train_loss /= len(train_loader.dataset)
-        train_history['train_loss'].append(train_loss)
+        train_mse_sum /= len(train_loader.dataset)
+        train_phy_sum /= len(train_loader.dataset)
 
-        # ====================== 测试阶段加入PINN损失 ======================
         model.eval()
+
         test_loss = 0.0
-        with torch.no_grad():  # 仍保留no_grad，避免测试阶段计算梯度
-            for batch_feat, batch_label in test_loader:
+        test_mse_sum = 0.0
+        test_phy_sum = 0.0
+
+        with torch.no_grad():
+            for batch_feat, batch_label, raw_force, raw_plastic, _ in test_loader:
                 batch_feat = batch_feat.to(device)
                 batch_label = batch_label.to(device)
+                raw_force = raw_force.to(device)
+                raw_plastic = raw_plastic.to(device)
+
                 outputs = model(batch_feat)
 
-                # 1. 计算测试MSE损失（纯预测损失）
-                test_mse_loss = criterion(outputs, batch_label)
+                mse_loss = criterion(outputs, batch_label)
+                phy_loss = cdm_physical_loss(outputs, raw_force, raw_plastic, cfg)
+                total_loss = mse_loss + cfg["physics_loss_weight"] * phy_loss
 
-                # 2. 提取归一化轴向力、塑性应变（和训练阶段一致）
-                normalized_force = batch_feat[..., 0:1]
-                normalized_plastic_strain = batch_feat[..., 1:2]
+                bs = batch_feat.size(0)
+                test_loss += total_loss.item() * bs
+                test_mse_sum += mse_loss.item() * bs
+                test_phy_sum += phy_loss.item() * bs
 
-                # 3. 计算测试PINN物理损失
-                test_physical_loss = pinn_physical_loss(normalized_force, normalized_plastic_strain, config)
-
-                # 4. 测试总损失 = 测试MSE + 权重×测试PINN损失（权重和训练一致）
-                test_total_loss = test_mse_loss + config['pinn_loss_weight'] * test_physical_loss
-
-                # 5. 累加测试总损失（替代原有仅累加MSE）
-                test_loss += test_total_loss.item() * batch_feat.size(0)
-
-        # 测试损失归一化
         test_loss /= len(test_loader.dataset)
-        train_history['test_loss'].append(test_loss)
+        test_mse_sum /= len(test_loader.dataset)
+        test_phy_sum /= len(test_loader.dataset)
 
-        # 学习率调度
+        train_history["train_loss"].append(train_loss)
+        train_history["test_loss"].append(test_loss)
+        train_history["train_mse"].append(train_mse_sum)
+        train_history["test_mse"].append(test_mse_sum)
+        train_history["train_phy"].append(train_phy_sum)
+        train_history["test_phy"].append(test_phy_sum)
+
         scheduler.step(test_loss)
 
-        # 打印训练信息
         if (epoch + 1) % 10 == 0 or epoch == 0:
-            print(f'Epoch [{epoch + 1}/{config["epochs"]}], Train Loss: {train_loss:.6f}, Test Loss: {test_loss:.6f}')
+            print(
+                f"Epoch [{epoch + 1}/{cfg['epochs']}] "
+                f"Train Loss: {train_loss:.6f} | Test Loss: {test_loss:.6f} | "
+                f"Train MSE: {train_mse_sum:.6f} | Test MSE: {test_mse_sum:.6f} | "
+                f"Train CDM: {train_phy_sum:.6f} | Test CDM: {test_phy_sum:.6f}"
+            )
 
-        # 早停机制
         if early_stopping(test_loss, model):
-            print(f'Early stopping at epoch {epoch + 1}, best test loss: {early_stopping.best_loss:.6f}')
-            model.load_state_dict(early_stopping.best_model_state)
+            print(
+                f"Early stopping at epoch {epoch + 1}, "
+                f"best test loss: {early_stopping.best_loss:.6f}"
+            )
             break
 
-    # 加载最优模型
     if early_stopping.best_model_state is not None:
         model.load_state_dict(early_stopping.best_model_state)
 
     return model, train_history
 
-
-# ====================== 7. 贝叶斯预测函数 ======================
-def bayesian_predict(model, test_loader, config):
+def bayesian_predict(model, test_loader, cfg):
     model.eval()
-    device = config['device']
+
+    device = cfg["device"]
+
     y_true = []
     y_pred_samples = []
+    sample_names = []
 
-    # 强制开启所有Dropout层
     for m in model.modules():
         if isinstance(m, nn.Dropout):
             m.train()
-            m.p = config['dropout_rate']  # 强制设置Dropout概率
+            m.p = cfg["dropout_rate"]
 
     with torch.no_grad():
-        for batch_feat, batch_label in test_loader:
+        for batch_feat, batch_label, _, _, batch_names in test_loader:
             batch_feat = batch_feat.to(device)
             batch_label = batch_label.to(device)
 
-            # MCD多次采样
             batch_samples = []
-            for _ in range(config['mc_samples']):
+
+            for _ in range(cfg["mc_samples"]):
                 output = model(batch_feat)
                 batch_samples.append(output.cpu().numpy())
 
-            batch_samples = np.array(batch_samples)  # (mc_samples, batch_size, 1)
+            batch_samples = np.array(batch_samples)
+
             y_pred_samples.append(batch_samples)
             y_true.append(batch_label.cpu().numpy())
+            sample_names.extend(list(batch_names))
 
-    # 处理结果
-    y_true = np.concatenate(y_true, axis=0).squeeze()  # (n_test,)
-    y_pred_samples = np.concatenate(y_pred_samples, axis=1)  # (mc_samples, n_test, 1)
-    y_pred_samples = y_pred_samples.squeeze(-1)  # (mc_samples, n_test)
+    y_true = np.concatenate(y_true, axis=0).squeeze()
+    y_pred_samples = np.concatenate(y_pred_samples, axis=1).squeeze(-1)
 
-    # 计算均值和标准差（添加微小噪声，避免方差为0）
-    y_pred_mean = np.mean(y_pred_samples, axis=0)  # (n_test,)
-    y_pred_std = np.std(y_pred_samples, axis=0) + 1e-6  # 加微小噪声，避免方差为0
+    y_pred_mean = np.mean(y_pred_samples, axis=0)
+    y_pred_std = np.std(y_pred_samples, axis=0) + 1e-6
 
-    # 转换为实际寿命（反log10，优化标准差计算）
     y_true_actual = 10 ** y_true
     y_pred_mean_actual = 10 ** y_pred_mean
-    # 更准确的实际寿命标准差计算（避免近似误差）
-    y_pred_actual_samples = 10 ** y_pred_samples  # 先转换所有采样值，再算标准差
+
+    y_pred_actual_samples = 10 ** y_pred_samples
     y_pred_std_actual = np.std(y_pred_actual_samples, axis=0) + 1e-6
 
-    return y_true, y_pred_mean, y_pred_std, y_pred_samples, y_true_actual, y_pred_mean_actual, y_pred_std_actual
-
+    return (
+        sample_names,
+        y_true,
+        y_pred_mean,
+        y_pred_std,
+        y_pred_samples,
+        y_true_actual,
+        y_pred_mean_actual,
+        y_pred_std_actual,
+    )
 
 def calculate_metrics(y_true, y_pred_mean, y_true_actual, y_pred_mean_actual):
-    # Log10尺度指标
     mae_log = mean_absolute_error(y_true, y_pred_mean)
     rmse_log = np.sqrt(mean_squared_error(y_true, y_pred_mean))
     r2_log = r2_score(y_true, y_pred_mean)
 
-    # 实际寿命尺度指标
     mae_actual = mean_absolute_error(y_true_actual, y_pred_mean_actual)
     rmse_actual = np.sqrt(mean_squared_error(y_true_actual, y_pred_mean_actual))
     r2_actual = r2_score(y_true_actual, y_pred_mean_actual)
 
-    # 计算相对误差（工程常用）
-    relative_error = np.mean(np.abs((y_pred_mean_actual - y_true_actual) / (y_true_actual + 1e-8))) * 100  # 百分比
+    relative_error = (
+        np.mean(
+            np.abs(
+                (y_pred_mean_actual - y_true_actual)
+                / (y_true_actual + 1e-8)
+            )
+        )
+        * 100.0
+    )
 
-    metrics = {
-        'mae_log': mae_log,
-        'rmse_log': rmse_log,
-        'r2_log': r2_log,
-        'mae_actual': mae_actual,
-        'rmse_actual': rmse_actual,
-        'r2_actual': r2_actual,
-        'relative_error_pct': relative_error
+    return {
+        "mae_log": mae_log,
+        "rmse_log": rmse_log,
+        "r2_log": r2_log,
+        "mae_actual": mae_actual,
+        "rmse_actual": rmse_actual,
+        "r2_actual": r2_actual,
+        "relative_error_pct": relative_error,
     }
 
-    return metrics
+def save_metrics(metrics, cfg, filename):
+    pd.DataFrame([metrics]).to_csv(
+        os.path.join(cfg["save_metrics_dir"], f"{filename}.csv"),
+        index=False,
+    )
 
+    print(f"指标已保存到 {cfg['save_metrics_dir']}/{filename}.csv")
 
 def print_metrics(metrics):
-    print(f"Log10尺度 - MAE: {metrics['mae_log']:.4f}, RMSE: {metrics['rmse_log']:.4f}, R²: {metrics['r2_log']:.4f}")
     print(
-        f"实际寿命尺度 - MAE: {metrics['mae_actual']:.2f}, RMSE: {metrics['rmse_actual']:.2f}, R²: {metrics['r2_actual']:.4f}")
+        f"Log10尺度 - MAE: {metrics['mae_log']:.4f}, "
+        f"RMSE: {metrics['rmse_log']:.4f}, "
+        f"R²: {metrics['r2_log']:.4f}"
+    )
+
+    print(
+        f"实际寿命尺度 - MAE: {metrics['mae_actual']:.2f}, "
+        f"RMSE: {metrics['rmse_actual']:.2f}, "
+        f"R²: {metrics['r2_actual']:.4f}"
+    )
+
     print(f"实际寿命相对误差: {metrics['relative_error_pct']:.2f}%")
 
+def analyze_uncertainty(
+    y_true,
+    y_pred_mean,
+    y_pred_std,
+    y_true_actual,
+    y_pred_mean_actual,
+    y_pred_std_actual,
+    cfg,
+):
+    """
+    不确定性可靠性分析。
 
-# ====================== save_metrics函数，支持字典和DataFrame ======================
-def save_metrics(metrics, config, filename):
-    if isinstance(metrics, dict):
-        # 处理字典类型（基础指标、不确定性指标）
-        df = pd.DataFrame([metrics])
-    elif isinstance(metrics, pd.DataFrame):
-        # 处理DataFrame类型（鲁棒性指标）
-        df = metrics
-    else:
-        raise TypeError("metrics must be a dict or pandas DataFrame")
+    计算 MC Dropout 预测标准差 与 实际预测绝对误差之间的 Pearson 相关系数。
 
-    df.to_csv(os.path.join(config['save_metrics_dir'], f'{filename}.csv'), index=False)
-    print(f"\n指标已保存到 {config['save_metrics_dir']}/{filename}.csv")
+    注意：
+    这里计算的 r 不是 true life 和 predicted life 之间的相关系数，
+    而是：
 
+        r_log = corr(y_pred_std, |y_pred_mean - y_true|)
 
-def plot_base_results(y_true, y_pred_mean, y_pred_std, y_true_actual, y_pred_mean_actual, y_pred_std_actual,
-                      y_pred_samples, train_history, config):
-    # 1. 测试集预测准确度图（Log10尺度，带误差棒）
-    plt.figure(figsize=(10, 8))
-    plt.errorbar(
-        y_true, y_pred_mean, yerr=y_pred_std, fmt='o', ecolor='lightgray',
-        capsize=3, alpha=0.7, label='Predictions'
-    )
-    min_val = min(min(y_true), min(y_pred_mean))
-    max_val = max(max(y_true), max(y_pred_mean))
-    plt.plot([min_val, max_val], [min_val, max_val], 'r--', label='Perfect Prediction')
-    # 添加指标文本
-    mae_log = mean_absolute_error(y_true, y_pred_mean)
-    rmse_log = np.sqrt(mean_squared_error(y_true, y_pred_mean))
-    r2_log = r2_score(y_true, y_pred_mean)
-    plt.text(
-        0.05, 0.95,
-        f'MAE = {mae_log:.4f}\nRMSE = {rmse_log:.4f}\nR² = {r2_log:.4f}',
-        transform=plt.gca().transAxes, verticalalignment='top',
-        bbox=dict(boxstyle='round', facecolor='white', alpha=0.8)
-    )
-    plt.xlabel('True Log10(Remaining Life)')
-    plt.ylabel('Predicted Log10(Remaining Life)')
-    plt.title('Transformer + Bayesian (Gated Attention) Prediction Results (Log10 Scale)')
-    plt.legend()
-    plt.grid(alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(os.path.join(config['save_fig_dir'], 'test_accuracy_log10.png'), dpi=300)
-    plt.show()
+        r_actual = corr(y_pred_std_actual, |y_pred_mean_actual - y_true_actual|)
 
-    # 2. 实际寿命尺度预测准确度图
-    plt.figure(figsize=(10, 8))
-    plt.errorbar(
-        y_true_actual, y_pred_mean_actual, yerr=y_pred_std_actual, fmt='o', ecolor='lightgray',
-        capsize=3, alpha=0.7, label='Predictions'
-    )
-    min_val = min(min(y_true_actual), min(y_pred_mean_actual))
-    max_val = max(max(y_true_actual), max(y_pred_mean_actual))
-    plt.plot([min_val, max_val], [min_val, max_val], 'r--', label='Perfect Prediction')
-    # 添加指标文本
-    mae_actual = mean_absolute_error(y_true_actual, y_pred_mean_actual)
-    rmse_actual = np.sqrt(mean_squared_error(y_true_actual, y_pred_mean_actual))
-    r2_actual = r2_score(y_true_actual, y_pred_mean_actual)
-    plt.text(
-        0.05, 0.95,
-        f'MAE = {mae_actual:.2f}\nRMSE = {rmse_actual:.2f}\nR² = {r2_actual:.4f}',
-        transform=plt.gca().transAxes, verticalalignment='top',
-        bbox=dict(boxstyle='round', facecolor='white', alpha=0.8)
-    )
-    plt.xlabel('True Remaining Life (Cycles)')
-    plt.ylabel('Predicted Remaining Life (Cycles)')
-    plt.title('Transformer + Bayesian (Gated Attention) Prediction Results (Actual Scale)')
-    plt.legend()
-    plt.grid(alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(os.path.join(config['save_fig_dir'], 'test_accuracy_actual.png'), dpi=300)
-    plt.show()
+    工程含义：
+    如果 r 越接近 1，说明模型给出的预测不确定性越能反映真实预测误差；
+    即模型认为“不确定”的样本，实际误差也更大。
+    """
 
-    # 3. 寿命预测分布直方图
-    plt.figure(figsize=(12, 6))
-    sample_indices = [0, len(y_true) // 2, -1]
-    for i, idx in enumerate(sample_indices):
-        plt.subplot(1, 3, i + 1)
-        sns.histplot(y_pred_samples[:, idx], kde=True, bins=15, label='Prediction Distribution', color='skyblue')
-        plt.axvline(y_true[idx], color='r', linestyle='--', label=f'True: {y_true[idx]:.4f}')
-        plt.axvline(y_pred_mean[idx], color='g', linestyle='-', label=f'Mean: {y_pred_mean[idx]:.4f}')
-        plt.xlabel('Log10(Remaining Life)')
-        plt.ylabel('Probability Density')
-        plt.title(f'Sample {idx + 1}')
-        plt.legend()
-        plt.grid(alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(os.path.join(config['save_fig_dir'], 'life_distributions.png'), dpi=300)
-    plt.show()
-
-    # 4. 训练/测试损失曲线
-    plt.figure(figsize=(10, 6))
-    plt.plot(train_history['train_loss'], label='Train Loss', color='blue')
-    plt.plot(train_history['test_loss'], label='Test Loss', color='red')
-    plt.xlabel('Epoch')
-    plt.ylabel('MSE Loss')
-    plt.title('Training and Test Loss Curve')
-    plt.legend()
-    plt.grid(alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(os.path.join(config['save_fig_dir'], 'loss_curve.png'), dpi=300)
-    plt.show()
-
-    # 5. 实际寿命预测误差分布
-    error = y_pred_mean_actual - y_true_actual
-    plt.figure(figsize=(10, 6))
-    sns.histplot(error, kde=True, bins=20, color='orange', edgecolor='black')
-    plt.axvline(0, color='r', linestyle='--', label='Zero Error')
-    plt.xlabel('Prediction Error (Cycles)')
-    plt.ylabel('Frequency')
-    plt.title('Distribution of Prediction Errors (Actual Life Scale)')
-    plt.legend()
-    plt.grid(alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(os.path.join(config['save_fig_dir'], 'error_distribution.png'), dpi=300)
-    plt.show()
-
-
-def analyze_uncertainty(y_true, y_pred_mean, y_pred_std, y_true_actual, y_pred_mean_actual, y_pred_std_actual, config):
     print("\n===== 不确定性可靠性分析 =====")
-    # 计算实际误差（Log10尺度和实际尺度）
-    error_log = np.abs(y_pred_mean - y_true)  # Log10尺度绝对误差
-    error_actual = np.abs(y_pred_mean_actual - y_true_actual)  # 实际尺度绝对误差
 
-    # 清理异常值（nan/inf）
+    # 1. 计算绝对误差
+    error_log = np.abs(y_pred_mean - y_true)
+    error_actual = np.abs(y_pred_mean_actual - y_true_actual)
+
+    # 2. 清理 nan 和 inf
     def clean_nan_inf(arr):
-        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+        arr = np.asarray(arr).astype(np.float64)
+        arr = np.nan_to_num(
+            arr,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
         return arr
 
     y_pred_std = clean_nan_inf(y_pred_std)
@@ -577,426 +820,398 @@ def analyze_uncertainty(y_true, y_pred_mean, y_pred_std, y_true_actual, y_pred_m
     y_pred_std_actual = clean_nan_inf(y_pred_std_actual)
     error_actual = clean_nan_inf(error_actual)
 
-    # 检查方差是否为0，避免pearsonr返回nan
+    # 3. 安全计算 Pearson 相关系数
     def safe_pearsonr(x, y):
-        if np.var(x) < 1e-8 or np.var(y) < 1e-8:
-            print(f"警告：输入数据方差为0，无法计算相关系数")
-            return np.nan, np.nan
-        # 过滤掉x/y中值相同的情况（仅保留有波动的样本）
-        mask = (x != x[0]) | (y != y[0])
-        if np.sum(mask) < 2:  # 至少需要2个不同样本才能计算相关系数
-            print(f"警告：有效样本数不足，无法计算相关系数")
-            return np.nan, np.nan
-        return pearsonr(x[mask], y[mask])
+        x = np.asarray(x).flatten()
+        y = np.asarray(y).flatten()
 
-    # 计算皮尔逊相关系数
+        valid_mask = np.isfinite(x) & np.isfinite(y)
+        x = x[valid_mask]
+        y = y[valid_mask]
+
+        if len(x) < 2:
+            print("警告：有效样本数小于 2，无法计算 Pearson 相关系数")
+            return np.nan, np.nan
+
+        if np.var(x) < 1e-12 or np.var(y) < 1e-12:
+            print("警告：输入数据方差过小，无法计算 Pearson 相关系数")
+            return np.nan, np.nan
+
+        return pearsonr(x, y)
+
+    # 4. 计算相关系数
     corr_log, p_value_log = safe_pearsonr(y_pred_std, error_log)
-    corr_actual, p_value_actual = safe_pearsonr(y_pred_std_actual, error_actual)
+    corr_actual, p_value_actual = safe_pearsonr(
+        y_pred_std_actual,
+        error_actual,
+    )
 
-    # 打印结果（兼容nan）
-    print(f"Log10尺度：标准差与实际误差的相关系数 = {corr_log:.4f}" if not np.isnan(corr_log) else "Log10尺度：相关系数计算失败（方差为0/样本不足）")
-    print(f"实际寿命尺度：标准差与实际误差的相关系数 = {corr_actual:.4f}" if not np.isnan(corr_actual) else "实际寿命尺度：相关系数计算失败（方差为0/样本不足）")
-    print("说明：相关系数越接近1，说明模型的不确定性评估越可靠（标准差大→误差大）")
+    # 5. 打印结果
+    if not np.isnan(corr_log):
+        print(
+            f"Log10尺度：预测标准差与绝对误差的 Pearson r = {corr_log:.4f}, "
+            f"p-value = {p_value_log:.4e}"
+        )
+    else:
+        print("Log10尺度：Pearson r 计算失败")
 
-    # 可视化（兼容nan，避免绘图报错）
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+    if not np.isnan(corr_actual):
+        print(
+            f"实际寿命尺度：预测标准差与绝对误差的 Pearson r = {corr_actual:.4f}, "
+            f"p-value = {p_value_actual:.4e}"
+        )
+    else:
+        print("实际寿命尺度：Pearson r 计算失败")
+
+    print(
+        "说明：r 越接近 1，说明模型的不确定性估计越可靠，"
+        "即预测标准差越大，实际预测误差也越大。"
+    )
+
+    # 6. 可视化：不确定性 vs 误差
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
     # Log10尺度
-    ax1.scatter(y_pred_std, error_log, alpha=0.7, color='blue')
-    ax1.set_xlabel('Predicted Std (Log10 Scale)')
-    ax1.set_ylabel('Absolute Error (Log10 Scale)')
-    ax1_title = f'Log10 Scale (Corr = {corr_log:.4f})' if not np.isnan(corr_log) else 'Log10 Scale (Corr = N/A)'
-    ax1.set_title(ax1_title)
-    ax1.grid(alpha=0.3)
-    # 仅当相关系数有效时添加拟合线
+    axes[0].scatter(
+        y_pred_std,
+        error_log,
+        alpha=0.75,
+        color="blue",
+        edgecolor="k",
+    )
+
+    axes[0].set_xlabel("Predicted Std (Log10 Scale)")
+    axes[0].set_ylabel("Absolute Error (Log10 Scale)")
+
     if not np.isnan(corr_log):
-        z = np.polyfit(y_pred_std, error_log, 1)
-        p = np.poly1d(z)
-        ax1.plot(y_pred_std, p(y_pred_std), "r--")
+        axes[0].set_title(f"Log10 Scale: r = {corr_log:.4f}")
+
+        if np.var(y_pred_std) >= 1e-12:
+            z = np.polyfit(y_pred_std, error_log, 1)
+            p = np.poly1d(z)
+            axes[0].plot(
+                y_pred_std,
+                p(y_pred_std),
+                "r--",
+                linewidth=2,
+            )
+    else:
+        axes[0].set_title("Log10 Scale: r = N/A")
+
+    axes[0].grid(alpha=0.3)
 
     # 实际寿命尺度
-    ax2.scatter(y_pred_std_actual, error_actual, alpha=0.7, color='orange')
-    ax2.set_xlabel('Predicted Std (Actual Scale, Cycles)')
-    ax2.set_ylabel('Absolute Error (Actual Scale, Cycles)')
-    ax2_title = f'Actual Scale (Corr = {corr_actual:.4f})' if not np.isnan(corr_actual) else 'Actual Scale (Corr = N/A)'
-    ax2.set_title(ax2_title)
-    ax2.grid(alpha=0.3)
-    # 仅当相关系数有效时添加拟合线
+    axes[1].scatter(
+        y_pred_std_actual,
+        error_actual,
+        alpha=0.75,
+        color="orange",
+        edgecolor="k",
+    )
+
+    axes[1].set_xlabel("Predicted Std (Actual Life Scale, Cycles)")
+    axes[1].set_ylabel("Absolute Error (Actual Life Scale, Cycles)")
+
     if not np.isnan(corr_actual):
-        z = np.polyfit(y_pred_std_actual, error_actual, 1)
-        p = np.poly1d(z)
-        ax2.plot(y_pred_std_actual, p(y_pred_std_actual), "r--")
+        axes[1].set_title(f"Actual Scale: r = {corr_actual:.4f}")
+
+        if np.var(y_pred_std_actual) >= 1e-12:
+            z = np.polyfit(y_pred_std_actual, error_actual, 1)
+            p = np.poly1d(z)
+            axes[1].plot(
+                y_pred_std_actual,
+                p(y_pred_std_actual),
+                "r--",
+                linewidth=2,
+            )
+    else:
+        axes[1].set_title("Actual Scale: r = N/A")
+
+    axes[1].grid(alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(os.path.join(config['save_fig_dir'], 'uncertainty_reliability.png'), dpi=300)
+
+    save_path = os.path.join(
+        cfg["save_fig_dir"],
+        "uncertainty_reliability.png",
+    )
+
+    plt.savefig(
+        save_path,
+        dpi=300,
+        facecolor="white",
+    )
+
     plt.show()
 
-    # 返回不确定性指标（兼容nan）
+    print(f"不确定性可靠性图已保存至: {save_path}")
+
+    # 7. 返回并保存指标
     uncertainty_metrics = {
-        'corr_log': corr_log if not np.isnan(corr_log) else -999,  # 用-999标记无效值
-        'p_value_log': p_value_log if not np.isnan(p_value_log) else -999,
-        'corr_actual': corr_actual if not np.isnan(corr_actual) else -999,
-        'p_value_actual': p_value_actual if not np.isnan(p_value_actual) else -999
+        "corr_log": corr_log if not np.isnan(corr_log) else -999,
+        "p_value_log": p_value_log if not np.isnan(p_value_log) else -999,
+        "corr_actual": corr_actual if not np.isnan(corr_actual) else -999,
+        "p_value_actual": p_value_actual if not np.isnan(p_value_actual) else -999,
     }
 
     return uncertainty_metrics
 
+def visualize_attention_heatmap(model, test_loader, cfg):
+    print("\n===== 注意力权重热力图 =====")
 
-def visualize_attention_weights(model, test_loader, config):
-    print("\n===== 门控注意力权重可视化 =====")
     model.eval()
-    device = config['device']
+    device = cfg["device"]
 
-    # 取第一个批次的第一个样本
-    for batch_feat, _ in test_loader:
+    for batch_feat, _, _, _, batch_names in test_loader:
         batch_feat = batch_feat.to(device)
+        sample_name = batch_names[0]
+
         with torch.no_grad():
-            _, attn_weights, gate_strength = model(batch_feat[:1], return_attention=True)
+            _, attn_weights, _ = model(
+                batch_feat[:1],
+                return_attention=True,
+            )
 
-        # 压缩注意力权重维度（去掉batch维度）
-        attn_weights = attn_weights.squeeze(0).cpu().numpy()  # (1000, 1000)
-        # 压缩门控强度维度（核心！取时间步维度的均值，转为一维）
-        gate_strength = gate_strength.squeeze(0).cpu().numpy()  # (1000, 1, 128)
-        # 方案1：取特征维度的均值（推荐，保留时间步趋势）
-        gate_strength = np.mean(gate_strength, axis=-1).squeeze()  # (1000,)
-        # 方案2：若特征维度为1，直接squeeze（备选）
-        # gate_strength = gate_strength.squeeze()  # 确保最终是(1000,)
+        if attn_weights is None:
+            print("当前模型未返回注意力权重，跳过热力图。")
+            return
 
-        # 1. 1000步注意力热力图
-        fig = plt.figure(figsize=(30, 28))
+        attn_weights = attn_weights.squeeze(0).cpu().numpy()
+
+        fig = plt.figure(figsize=(24, 24))
+
         ax_main = fig.add_axes([0.08, 0.08, 0.80, 0.88])
         ax_cbar = fig.add_axes([0.90, 0.08, 0.02, 0.88])
 
         im = ax_main.imshow(
             attn_weights,
-            cmap='coolwarm',
+            cmap="coolwarm",
             vmin=np.percentile(attn_weights, 5),
-            vmax=np.percentile(attn_weights, 95)
+            vmax=np.percentile(attn_weights, 95),
         )
+
         cbar = fig.colorbar(im, cax=ax_cbar)
-        cbar.set_label('Attention Weight', fontsize=30, labelpad=30)
-        cbar.ax.tick_params(labelsize=30)
+        cbar.ax.tick_params(labelsize=18)
 
-        ax_main.set_title('Gated Attention Weights', fontsize=30, pad=40)
-        ax_main.set_xlabel('Key Time Step', fontsize=30, labelpad=30)
-        ax_main.set_ylabel('Query Time Step', fontsize=30, labelpad=30)
-        ax_main.set_xticks(np.arange(0, 1001, 100))
-        ax_main.set_yticks(np.arange(0, 1001, 100))
-        ax_main.set_xticklabels(np.arange(0, 1001, 100), fontsize=30)
-        ax_main.set_yticklabels(np.arange(0, 1001, 100), fontsize=30)
-        ax_main.tick_params(axis='x', rotation=45, pad=15)
-        ax_main.tick_params(axis='y', pad=15)
+        ax_main.set_title(
+            f"Attention Heatmap - {sample_name}",
+            fontsize=20,
+            pad=20,
+        )
+
+        ax_main.set_xlabel(
+            "Key Time Step",
+            fontsize=18,
+        )
+
+        ax_main.set_ylabel(
+            "Query Time Step",
+            fontsize=18,
+        )
+
+        tick_step = 100
+        ticks = np.arange(0, cfg["target_length"] + 1, tick_step)
+
+        ax_main.set_xticks(ticks)
+        ax_main.set_yticks(ticks)
+        ax_main.set_xticklabels(
+            ticks,
+            fontsize=12,
+            rotation=45,
+        )
+        ax_main.set_yticklabels(
+            ticks,
+            fontsize=12,
+        )
+
+        save_path = os.path.join(
+            cfg["save_fig_dir"],
+            "attention_heatmap.png",
+        )
 
         plt.savefig(
-            os.path.join(config['save_fig_dir'], 'full_1000_attention_heatmap.png'),
+            save_path,
             dpi=200,
-            bbox_inches=None,
-            facecolor='white'
+            facecolor="white",
         )
+
         plt.show()
 
-        # 2. 门控强度曲线
-        fig2 = plt.figure(figsize=(15, 8), facecolor='white')
-        ax2 = fig2.add_axes([0.12, 0.12, 0.80, 0.80])
-        # 此时gate_strength是(1000,)，可直接绘图
-        ax2.plot(gate_strength, color='purple', alpha=0.8, linewidth=1.5)
-        ax2.set_title('Gated Attention Strength Over Time Steps', fontsize=30, pad=30)
-        ax2.set_xlabel('Time Step (0-1000)', fontsize=30, labelpad=20)
-        ax2.set_ylabel('Gate Strength (0-1)', fontsize=30, labelpad=20)
-        ax2.set_xticks(np.arange(0, 1001, 100))
-        ax2.set_yticks(np.arange(0, 1.01, 0.1))
-        ax2.tick_params(axis='x', labelsize=30, pad=10)
-        ax2.tick_params(axis='y', labelsize=30, pad=10)
-        ax2.grid(alpha=0.3, linewidth=1)
-        plt.savefig(
-            os.path.join(config['save_fig_dir'], 'gate_strength_curve.png'),
-            dpi=200,
-            bbox_inches=None,
-            facecolor='white'
-        )
-        plt.show()
+        print(f"注意力热力图已保存至: {save_path}")
 
-        # 统计信息
-        print(f"门控强度均值：{np.mean(gate_strength):.4f}")
-        print(f"门控强度最大值：{np.max(gate_strength):.4f}（时间步：{np.argmax(gate_strength)}）")
-        print(f"门控强度最小值：{np.min(gate_strength):.4f}（时间步：{np.argmin(gate_strength)}）")
         break
 
+if __name__ == "__main__":
+    np.random.seed(config["random_seed"])
+    torch.manual_seed(config["random_seed"])
 
-
-# ====================== 分组注意力分析 ======================
-def group_attention_analysis(model, test_loader, config, group_size=100):
-    print("\n===== 分组注意力分析 =====")
-    model.eval()
-    device = config['device']
-
-    # 取第一个批次的第一个样本
-    for batch_feat, _ in test_loader:
-        batch_feat = batch_feat.to(device)
-        with torch.no_grad():
-            _, attn_weights, _ = model(batch_feat[:1], return_attention=True)  # (1, seq_len, seq_len)
-        attn_weights = attn_weights.squeeze(0).cpu().numpy()  # (1000, 1000)
-        seq_len = attn_weights.shape[0]
-        num_groups = seq_len // group_size
-
-        # 1. 计算组内平均注意力权重
-        group_attn_mean = []
-        for i in range(num_groups):
-            start = i * group_size
-            end = start + group_size
-            group_attn = attn_weights[start:end, start:end]  # 组内自注意力
-            group_attn_mean.append(np.mean(group_attn))
-
-        # 2. 可视化组间注意力权重差异
-        plt.figure(figsize=(12, 6))
-        x_ticks = [f'Group {i + 1}\n({i * group_size}-{(i + 1) * group_size - 1})' for i in range(num_groups)]
-        # 修正：移除marker='o'，新增edgecolor美化
-        plt.bar(x_ticks, group_attn_mean, color='teal', edgecolor='black', alpha=0.8)
-        plt.xlabel('Feature Groups (Time Steps)')
-        plt.ylabel('Average Attention Weight')
-        plt.title('Group-wise Attention权重平均值对比')
-        plt.grid(alpha=0.3, axis='y')
-        plt.tight_layout()
-        plt.savefig(os.path.join(config['save_fig_dir'], 'group_attention_comparison.png'), dpi=300)
-        plt.show()
-
-        # 3. 绘制组间注意力热力图
-        if num_groups >= 3:
-            plt.figure(figsize=(15, 5))
-            for i in range(3):
-                start = i * group_size
-                end = start + group_size
-                plt.subplot(1, 3, i + 1)
-                sns.heatmap(attn_weights[start:end, start:end], cmap='coolwarm', cbar=False)
-                plt.title(f'Group {i + 1} Attention Heatmap')
-                plt.xlabel('Within Group Time Step')
-                plt.ylabel('Within Group Time Step')
-            plt.tight_layout()
-            plt.savefig(os.path.join(config['save_fig_dir'], 'group_attention_heatmaps.png'), dpi=300)
-            plt.show()
-        break
-
-
-# ====================== 特征贡献度计算 ======================
-def calculate_feature_contribution(model, test_loader, config):
-    print("\n===== 特征贡献度分析 =====")
-    model.eval()  # 保持eval模式，但Dropout/BatchNorm仍按eval，仅梯度计算启用
-    device = config['device']
-    # 1. 基于注意力权重的贡献度（平均注意力权重）
-    attn_contribution = []
-    # 2. 基于梯度的贡献度（输入特征的梯度绝对值）
-    grad_contribution = []
-
-    for batch_feat, batch_label in test_loader:
-        # 启用输入特征的梯度计算（必须）
-        batch_feat = batch_feat.to(device).requires_grad_(True)
-        batch_label = batch_label.to(device)
-
-        # 移除整体torch.no_grad()，仅对注意力权重的提取使用no_grad（避免影响梯度）
-        # 前向传播获取输出和注意力权重（保留计算图用于梯度计算）
-        outputs, attn_weights, _ = model(batch_feat, return_attention=True)
-
-        # 处理注意力权重（无需梯度，单独包裹no_grad）
-        with torch.no_grad():
-            # 计算注意力贡献度（平均查询-键注意力）
-            attn_mean = attn_weights.mean(dim=1).mean(dim=0)  # (seq_len,)
-            attn_contribution.append(attn_mean.cpu().numpy())
-
-        # 计算梯度贡献度（输出对输入的梯度）
-        model.zero_grad()  # 清空之前的梯度
-        # 计算损失（用MSE损失代替mean，更贴合任务，且梯度更合理）
-        loss = torch.nn.functional.mse_loss(outputs, batch_label)
-        loss.backward(retain_graph=False)  # 无需保留图，计算后释放
-
-        # 提取输入特征的梯度
-        if batch_feat.grad is not None:
-            grad = batch_feat.grad  # (batch, seq_len, 1)
-            grad_mean = grad.abs().mean(dim=0).squeeze().cpu().numpy()  # (seq_len,)
-            grad_contribution.append(grad_mean)
-        else:
-            print("警告：输入特征梯度为None，可能是模型结构问题")
-            grad_mean = np.zeros(batch_feat.shape[1])  # 兜底
-            grad_contribution.append(grad_mean)
-
-        break  # 仅用第一个批次计算
-
-    # 聚合贡献度
-    attn_contribution = np.mean(attn_contribution, axis=0)  # (1000,)
-    grad_contribution = np.mean(grad_contribution, axis=0)  # (1000,)
-
-    # 归一化（避免除零错误）
-    attn_max = attn_contribution.max()
-    attn_min = attn_contribution.min()
-    if attn_max - attn_min < 1e-8:
-        attn_contribution = np.zeros_like(attn_contribution)
-    else:
-        attn_contribution = (attn_contribution - attn_min) / (attn_max - attn_min)
-
-    grad_max = grad_contribution.max()
-    grad_min = grad_contribution.min()
-    if grad_max - grad_min < 1e-8:
-        grad_contribution = np.zeros_like(grad_contribution)
-    else:
-        grad_contribution = (grad_contribution - grad_min) / (grad_max - grad_min)
-
-    # 可视化两种贡献度对比
-    plt.figure(figsize=(14, 6))
-    plt.subplot(1, 2, 1)
-    plt.plot(attn_contribution, color='blue', alpha=0.7, marker='.', markersize=2)
-    plt.title('特征贡献度（基于注意力权重）')
-    plt.xlabel('Time Step')
-    plt.ylabel('Normalized Contribution')
-    plt.grid(alpha=0.3)
-
-    plt.subplot(1, 2, 2)
-    plt.plot(grad_contribution, color='red', alpha=0.7, marker='.', markersize=2)
-    plt.title('特征贡献度（基于梯度）')
-    plt.xlabel('Time Step')
-    plt.ylabel('Normalized Contribution')
-    plt.grid(alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(config['save_fig_dir'], 'feature_contribution_comparison.png'), dpi=300)
-    plt.show()
-    # 输出Top10重要时间步
-    top_attn_idx = np.argsort(attn_contribution)[-10:][::-1]
-    top_grad_idx = np.argsort(grad_contribution)[-10:][::-1]
-    print(f"注意力权重Top10时间步：{top_attn_idx}")
-    print(f"梯度Top10时间步：{top_grad_idx}")
-    return attn_contribution, grad_contribution
-
-
-# 在stage3_analysis函数中添加调用
-def stage3_analysis(model, test_loader, y_true, y_pred_mean, y_pred_std, y_true_actual, y_pred_mean_actual, y_pred_std_actual, y_pred_samples, train_history, config):
-    # 1. 计算多尺度评估指标
-    metrics = calculate_metrics(y_true, y_pred_mean, y_true_actual, y_pred_mean_actual)
-    # 保存指标到CSV
-    save_metrics(metrics, config, 'base_metrics')
-    print("\n===== 基础性能指标 =====")
-    print_metrics(metrics)
-
-    # 2. 基础可视化（预测准确度、损失曲线、寿命分布）
-    plot_base_results(y_true, y_pred_mean, y_pred_std, y_true_actual, y_pred_mean_actual, y_pred_std_actual, y_pred_samples, train_history, config)
-
-    # 3. 不确定性可靠性分析
-    if config['uncertainty_analysis']:
-        uncertainty_metrics = analyze_uncertainty(y_true, y_pred_mean, y_pred_std, y_true_actual, y_pred_mean_actual, y_pred_std_actual, config)
-        save_metrics(uncertainty_metrics, config, 'uncertainty_metrics')
-
-    # 4. 门控注意力权重可视化
-    if config['visualize_attention'] and config['gate_attention']:
-        visualize_attention_weights(model, test_loader, config)
-    return metrics
-# ====================== 9. 主流程 ======================
-if __name__ == '__main__':
-    # ====================== 1. 加载全量数据集 ======================
-    full_dataset = FatigueDataset(config['data_dir'])
-    all_sample_ids = sorted(list(full_dataset.metadata['sample_id'].unique()))
-    print(f"全量数据集样本总数：{len(all_sample_ids)}")
-
-    # ====================== 2. 分层采样划分训练/测试集 ======================
-    # 固定随机种子保证可复现
-    np.random.seed(config['random_seed'])
-    torch.manual_seed(config['random_seed'])
-
-    # 分层采样：按log剩余寿命分5层，每层按30%采样（避免小样本漏掉关键工况）
-    import pandas as pd
-
-    metadata = full_dataset.metadata.copy()
-    # 按log剩余寿命分层（避免空bin，用qcut均分）
-    metadata['life_bin'] = pd.qcut(
-        metadata['log_remaining_life'],
-        q=3,  # 分5层，可根据样本量调整（如样本<50则分3层）
-        duplicates='drop'  # 处理重复值导致的bin数量不足
+    # 1. 加载归一化后元数据
+    metadata_path = os.path.join(
+        config["data_dir"],
+        "metadata.csv",
     )
 
-    # 每层按30%采样
-    train_ids = []
-    for bin_val in metadata['life_bin'].unique():
-        bin_ids = metadata[metadata['life_bin'] == bin_val]['sample_id'].tolist()
-        train_bin_size = max(1, int(len(bin_ids) * config['train_ratio']))  # 至少1个样本
-        train_bin_ids = np.random.choice(bin_ids, size=train_bin_size, replace=False)
-        train_ids.extend(train_bin_ids)
+    metadata = pd.read_csv(metadata_path)
 
-    # 测试集：不在训练集的所有样本
-    test_ids = [id for id in all_sample_ids if id not in train_ids]
+    # 2. 加载原始未归一化参考数据，用于CDM物理损失
+    raw_reference_map = load_raw_reference_map(
+        RAW_PATHS,
+        cycle_ratio=config["cycle_ratio"],
+        target_length=config["target_length"],
+    )
 
-    # 打印划分结果（验证30%比例）
-    train_ratio_actual = len(train_ids) / len(all_sample_ids)
-    test_ratio_actual = len(test_ids) / len(all_sample_ids)
-    print(f"训练集样本数：{len(train_ids)}（实际占比：{train_ratio_actual:.1%}）")
-    print(f"测试集样本数：{len(test_ids)}（实际占比：{test_ratio_actual:.1%}）")
+    # 3. 分组划分训练/测试集，确保同一原始试件及增强样本不泄漏
+    train_ids, test_ids, train_base_names, test_base_names = create_grouped_train_test_split(
+        metadata,
+        train_ratio=config["train_ratio"],
+        random_seed=config["random_seed"],
+    )
 
-    # ====================== 3. 构建训练/测试数据集和DataLoader ======================
-    train_dataset = FatigueDataset(config['data_dir'], sample_ids=train_ids)
-    test_dataset = FatigueDataset(config['data_dir'], sample_ids=test_ids)
+    print(f"\n原始试件分组数: {len(set(metadata['sample_name'].apply(base_sample_name)))}")
+    print(f"训练集原始试件数: {len(train_base_names)}")
+    print(f"测试集原始试件数: {len(test_base_names)}")
+    print(f"训练样本数(含增强): {len(train_ids)}")
+    print(f"测试样本数(含增强): {len(test_ids)}")
 
-    # 创建数据加载器（适配小样本的batch_size=4）
+    # 4. 构建数据集
+    train_dataset = FatigueDataset(
+        config["data_dir"],
+        raw_reference_map,
+        sample_ids=train_ids,
+    )
+
+    test_dataset = FatigueDataset(
+        config["data_dir"],
+        raw_reference_map,
+        sample_ids=test_ids,
+    )
+
     train_loader = DataLoader(
         train_dataset,
-        batch_size=config['batch_size'],
-        shuffle=True,  # 训练集打乱
-        drop_last=False  # 小样本不丢弃最后一个批次
+        batch_size=config["batch_size"],
+        shuffle=True,
+        drop_last=False,
     )
+
     test_loader = DataLoader(
         test_dataset,
-        batch_size=config['batch_size'],
-        shuffle=False  # 测试集不打乱
+        batch_size=config["batch_size"],
+        shuffle=False,
+        drop_last=False,
     )
 
-    # ====================== 4. 初始化带门控注意力的Transformer模型 ======================
+    # 5. 初始化模型
     model = TransformerRegressor(
-        input_dim=2,  # 输入维度：归一化轴向力 + 归一化塑性应变
-        d_model=config['d_model'],
-        nhead=config['nhead'],
-        num_encoder_layers=config['num_encoder_layers'],
-        dim_feedforward=config['dim_feedforward'],
-        dropout_rate=config['dropout_rate'],
-        gate_attention=config['gate_attention']
-    ).to(config['device'])
+        input_dim=2,
+        d_model=config["d_model"],
+        nhead=config["nhead"],
+        num_encoder_layers=config["num_encoder_layers"],
+        dim_feedforward=config["dim_feedforward"],
+        dropout_rate=config["dropout_rate"],
+        gate_attention=config["gate_attention"],
+    ).to(config["device"])
 
-    print(f"\n模型初始化完成，运行设备：{config['device']}")
-    print(f"是否启用门控注意力：{config['gate_attention']}")
-    print(f"PINN物理损失权重：{config['pinn_loss_weight']}")
+    print(f"\n模型初始化完成，运行设备: {config['device']}")
+    print(f"是否启用门控注意力: {config['gate_attention']}")
+    print(f"CDM物理损失权重: {config['physics_loss_weight']}")
 
-    # ====================== 5. 训练模型（含PINN物理损失） ======================
-    print("\n===== 开始训练模型（30%训练集 + PINN物理约束） =====")
-    model, train_history = train_model(model, train_loader, test_loader, config)
+    # 6. 训练
+    print("\n===== 开始训练模型（分组划分 + CDM物理约束） =====")
 
-    # ====================== 6. 贝叶斯预测（MCD蒙特卡洛Dropout） ======================
-    print("\n===== 开始贝叶斯预测（不确定性评估） =====")
-    results = bayesian_predict(model, test_loader, config)
-    y_true, y_pred_mean, y_pred_std, y_pred_samples, y_true_actual, y_pred_mean_actual, y_pred_std_actual = results
-
-    # ====================== 7. 阶段三：多维度性能验证与可视化 ======================
-    print("\n===== 开始阶段三：模型性能多维度验证 =====")
-    metrics = stage3_analysis(
-        model, test_loader,
-        y_true, y_pred_mean, y_pred_std,
-        y_true_actual, y_pred_mean_actual, y_pred_std_actual,
-        y_pred_samples, train_history, config
+    model, train_history = train_model(
+        model,
+        train_loader,
+        test_loader,
+        config,
     )
 
-    # ====================== 8. 保存预测结果 ======================
-    results_df = pd.DataFrame({
-        'sample_id': test_ids,
-        'true_log_life': y_true,
-        'pred_log_life_mean': y_pred_mean,
-        'pred_log_life_std': y_pred_std,
-        'true_actual_life': y_true_actual,
-        'pred_actual_life_mean': y_pred_mean_actual,
-        'pred_actual_life_std': y_pred_std_actual
-    })
-    results_save_path = os.path.join(config['save_fig_dir'], 'prediction_results_30pct_train.csv')
-    results_df.to_csv(results_save_path, index=False)
-    print(f"\n预测结果已保存至：{results_save_path}")
+    # 7. 贝叶斯预测
+    print("\n===== 开始贝叶斯预测（MCDropout） =====")
 
-    # ====================== 9. 额外：分组注意力分析 + 特征贡献度分析（可选） ======================
-    if config['visualize_attention'] and config['gate_attention']:
-        print("\n===== 执行分组注意力分析 =====")
-        group_attention_analysis(model, test_loader, config, group_size=100)
+    (
+        sample_names,
+        y_true,
+        y_pred_mean,
+        y_pred_std,
+        y_pred_samples,
+        y_true_actual,
+        y_pred_mean_actual,
+        y_pred_std_actual,
+    ) = bayesian_predict(
+        model,
+        test_loader,
+        config,
+    )
 
-        print("\n===== 执行特征贡献度分析 =====")
-        attn_contribution, grad_contribution = calculate_feature_contribution(model, test_loader, config)
+    # 8. 计算基础性能指标
+    print("\n===== 模型性能指标 =====")
 
-    print("\n===== 30%训练集完整流程执行完成 =====")
+    metrics = calculate_metrics(
+        y_true,
+        y_pred_mean,
+        y_true_actual,
+        y_pred_mean_actual,
+    )
+
+    print_metrics(metrics)
+
+    save_metrics(
+        metrics,
+        config,
+        "base_metrics",
+    )
+
+    # 8.1 计算不确定性标准差与实际误差之间的 Pearson 相关系数
+    if config.get("uncertainty_analysis", True):
+        uncertainty_metrics = analyze_uncertainty(
+            y_true,
+            y_pred_mean,
+            y_pred_std,
+            y_true_actual,
+            y_pred_mean_actual,
+            y_pred_std_actual,
+            config,
+        )
+
+        save_metrics(
+            uncertainty_metrics,
+            config,
+            "uncertainty_metrics",
+        )
+
+    # 9. 保存预测结果
+    results_df = pd.DataFrame(
+        {
+            "sample_name": sample_names,
+            "base_sample_name": [base_sample_name(x) for x in sample_names],
+            "variant": [get_variant_name(x) for x in sample_names],
+            "true_log_life": y_true,
+            "pred_log_life_mean": y_pred_mean,
+            "pred_log_life_std": y_pred_std,
+            "true_actual_life": y_true_actual,
+            "pred_actual_life_mean": y_pred_mean_actual,
+            "pred_actual_life_std": y_pred_std_actual,
+        }
+    )
+
+    results_save_path = os.path.join(
+        config["save_fig_dir"],
+        "prediction_results_group_split.csv",
+    )
+
+    results_df.to_csv(
+        results_save_path,
+        index=False,
+    )
+
+    print(f"\n预测结果已保存至: {results_save_path}")
+
+    # 10. 注意力热力图
+    if config["visualize_attention"] and config["gate_attention"]:
+        visualize_attention_heatmap(
+            model,
+            test_loader,
+            config,
+        )
+
+    print("\n===== 全流程执行完成 =====")
